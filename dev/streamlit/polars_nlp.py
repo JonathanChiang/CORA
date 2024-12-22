@@ -1,54 +1,63 @@
 import streamlit as st
-import requests
 import polars as pl
 import re
+import ollama
 
-# ------------------------------------------------------------------------------
-# CONFIG & INITIALIZATION
-# ------------------------------------------------------------------------------
-st.set_page_config(page_title="Polars + Ollama Natural Language Demo", layout="wide")
-
-# Create a sample Polars DataFrame ("users" table)
+# Create a sample Polars DataFrame (pretend it's "taxi" table)
 df = pl.DataFrame({
-    "user_id": [1, 2, 3],
-    "username": ["alice", "bob", "charlie"],
-    "created_at": ["2024-01-01 10:00:00", "2024-01-02 09:30:00", "2024-01-02 15:45:00"]
+    "VendorID": [1, 2, 2],
+    "tpep_pickup_datetime": [
+        "2024-01-01 00:15:27",
+        "2024-01-01 01:45:30",
+        "2024-01-01 02:10:10",
+    ],
+    "tpep_dropoff_datetime": [
+        "2024-01-01 00:25:00",
+        "2024-01-01 02:00:00",
+        "2024-01-01 02:25:00",
+    ],
+    "passenger_count": [1.0, 2.0, 1.0],
+    "trip_distance": [1.2, 3.5, 2.2],
+    "fare_amount": [7.0, 13.5, 10.0],
+    "extra": [0.5, 1.0, 0.5],
+    "tip_amount": [1.0, 2.0, 1.5],
+    "tolls_amount": [0.0, 0.0, 1.0],
+    "improvement_surcharge": [0.3, 0.3, 0.3],
+    "total_amount": [8.8, 16.8, 13.3],
 })
 
-# Ollama server endpoint (ensure you have ollama running locally, e.g.:
-# `ollama serve --model /path/to/model.bin --port 11400`)
-OLLAMA_URL = "http://localhost:11400/generate"
-
-# Example system instructions for the LLM
-SYSTEM_PROMPT = """
-SYSTEM: You are a helpful assistant that translates natural language questions into valid SQL.
-Return only the SQL query in triple backticks like ```sql ... ```.
-
-USER: {user_question}
-
-ASSISTANT:
+# A simple system prompt describing the schema
+SYSTEM_SCHEMA = """Here is the database schema that the SQL query will run on:
+CREATE TABLE taxi (
+    VendorID bigint,
+    tpep_pickup_datetime timestamp,
+    tpep_dropoff_datetime timestamp,
+    passenger_count double,
+    trip_distance double,
+    fare_amount double,
+    extra double,
+    tip_amount double,
+    tolls_amount double,
+    improvement_surcharge double,
+    total_amount double
+);
 """
 
-# ------------------------------------------------------------------------------
-# HELPER FUNCTIONS
-# ------------------------------------------------------------------------------
-def query_ollama(prompt: str) -> str:
+def query_ollama(user_prompt: str) -> str:
     """
-    Sends a prompt to the local Ollama server (running on port 11400).
-    Returns the raw LLM output as a string.
+    Generate SQL via Ollama, using duckdb-nsql:7b-q4_0.
     """
-    try:
-        response = requests.post(OLLAMA_URL, json={"prompt": prompt})
-        response.raise_for_status()
-        return response.json().get("content", "")
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error communicating with Ollama: {e}")
-        return ""
+    response_dict = ollama.generate(
+        model="duckdb-nsql:7b-q4_0",
+        system=SYSTEM_SCHEMA,
+        prompt=user_prompt,
+    )
+    return response_dict.get("response", "")
 
 def extract_sql(llm_output: str) -> str:
     """
-    Attempt to extract an SQL statement from the LLM output.
-    If the LLM encloses it in ```sql ... ```, parse it out with a regex.
+    If the LLM encloses SQL in ```sql ... ```, parse it out.
+    Otherwise, return the raw string.
     """
     pattern = r"```sql(.*?)```"
     match = re.search(pattern, llm_output, re.DOTALL | re.IGNORECASE)
@@ -56,96 +65,30 @@ def extract_sql(llm_output: str) -> str:
         return match.group(1).strip()
     return llm_output.strip()
 
-# A very naive function to handle certain SQL queries in Polars.
-# For real applications, you'd need a robust SQL parser or custom mapping logic.
-def run_sql_in_polars(sql_query: str, data: pl.DataFrame) -> pl.DataFrame:
-    """
-    Demonstrates how to manually interpret a specific SQL pattern in Polars.
-    E.g.: 
-    SELECT created_at::DATE as day, COUNT(*) as user_count
-    FROM users
-    GROUP BY day
-    ORDER BY user_count DESC
-    LIMIT 1;
-    """
-    # Lowercase for naive matching
-    lower_sql = sql_query.lower()
+st.title("Minimal Polars + Ollama SQL Demo")
 
-    # Example: If the question is about grouping by day and counting
-    # (like "show me the day with the most users joining"):
-    if "group by" in lower_sql and "created_at" in lower_sql and "count(" in lower_sql:
-        # We'll parse out "day" by casting created_at to a date and counting.
-        # Pseudocode for the typical logic:
-        polars_df = (
-            data
-            .with_column(
-                pl.col("created_at").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S").alias("created_dt")
-            )
-            .with_column(pl.col("created_dt").dt.truncate("1d").alias("day"))  # or dt.date()
-            .groupby("day")
-            .agg([
-                pl.count().alias("user_count")
-            ])
-            .sort("user_count", descending=True)
-        )
-        # If there's a LIMIT 1 in the SQL, we'll just head(1)
-        if "limit 1" in lower_sql:
-            polars_df = polars_df.head(1)
-
-        return polars_df
-
-    # If we don't have a known pattern, just return the original data
-    # or an empty DataFrame with a message
-    return pl.DataFrame()
-
-# ------------------------------------------------------------------------------
-# STREAMLIT UI
-# ------------------------------------------------------------------------------
-st.title("Polars + Ollama Natural Language Demo")
-
-st.markdown("""
-Enter a **natural language** question. We'll:
-1. Send it to Ollama to generate SQL.
-2. Show the SQL to you.
-3. If you approve, we'll attempt to interpret the SQL in Polars 
-   (using a naive pattern match).
-""")
-
-# Show sample data
-with st.expander("Sample DataFrame"):
-    st.write("We have a `users` table (Polars DataFrame):")
+# Display the sample DataFrame for reference
+with st.expander("Sample 'taxi' DataFrame"):
     st.dataframe(df)
 
-# Text area for user question
-user_question = st.text_area(
-    "Ask your question about this data:",
-    value="Show me the day with the most users joining"
-)
+# Let the user type a question
+user_prompt = st.text_input("Ask a question (the model will return SQL):", "SELECT * FROM taxi")
 
-if st.button("Generate SQL"):
-    # Build prompt
-    prompt_text = SYSTEM_PROMPT.format(user_question=user_question)
-    st.info(f"**Prompt sent to Ollama**:\n{prompt_text}")
-
-    # Call Ollama LLM
-    llm_output = query_ollama(prompt_text)
-
-    # Display raw LLM response
-    st.markdown("### Raw LLM Output:")
+if st.button("Generate & Run SQL"):
+    # Step 1: Generate SQL from Ollama
+    llm_output = query_ollama(user_prompt)
+    st.write("### LLM Output")
     st.code(llm_output, language="sql")
 
-    # Extract SQL
+    # Step 2: Extract actual SQL (handle possible code fences)
     sql_query = extract_sql(llm_output)
+    st.write("### Using SQL:")
+    st.code(sql_query, language="sql")
 
-    # Show the extracted SQL in a single-row table
-    st.markdown("### Extracted SQL Query:")
-    st.table([[sql_query]])
-
-    # Provide a button to confirm running the query logic in Polars
-    if st.button("Run this query in Polars"):
-        result_df = run_sql_in_polars(sql_query, df)
-        if result_df.is_empty():
-            st.warning("We don't have a custom parser for that SQL pattern yet!")
-        else:
-            st.markdown("#### Polars Output:")
-            st.dataframe(result_df)
+    # Step 3: Execute on Polars df
+    try:
+        results = df.sql(query=sql_query, table_name="taxi")
+        st.write("### Query Results")
+        st.dataframe(results)
+    except Exception as e:
+        st.error(f"SQL Error: {e}")
